@@ -1,7 +1,11 @@
-use rltk::{ RGB, Rltk, RandomNumberGenerator };
+use rltk::{RGB, Rltk, RandomNumberGenerator, BaseMap, Algorithm2D, Point};
 use std::cmp::{ max, min };
 
+use specs::prelude::*;
 use super::constants::*;
+use super::rect::*;
+use super::components::{Player, Viewshed};
+use rltk::console::Tile;
 
 
 #[derive(PartialEq, Copy, Clone)]
@@ -12,73 +16,164 @@ pub enum TileType
 }
 
 
-pub fn xy_idx(x: i32, y: i32) -> usize
+pub struct Map
 {
-    return (y as usize * SCREEN_WIDTH as usize) + x as usize;
+    pub tiles: Vec<TileType>,
+    pub rooms: Vec<Rect>,
+    pub width: i32,
+    pub height: i32,
+    pub revealed_tiles: Vec<bool>,
+    pub visible_tiles: Vec<bool>,
 }
 
 
-pub fn new_map() -> Vec<TileType>
+impl Map
 {
-    let mut map = vec![TileType::Floor; SCREEN_WIDTH as usize * SCREEN_HEIGHT as usize];
-
-    for x in 0..SCREEN_WIDTH
+    pub fn xy_idx(&self, x: i32, y: i32) -> usize
     {
-        map[xy_idx(x, 0)] = TileType::Wall;
-        map[xy_idx(x, SCREEN_HEIGHT - 1)] = TileType::Wall;
-    }
-    for y in 0..SCREEN_HEIGHT
-    {
-        map[xy_idx(0, y)] = TileType::Wall;
-        map[xy_idx(SCREEN_WIDTH - 1, y)] = TileType::Wall;
+        return (y as usize * self.width as usize) + x as usize;
     }
 
-    let mut rng = rltk::RandomNumberGenerator::new();
-
-    for _i in 0..400
+    fn apply_horizontal_tunnel(&mut self, x1: i32, x2: i32, y: i32)
     {
-        let x = rng.roll_dice(1, SCREEN_WIDTH -1 );
-        let y = rng.roll_dice(1, SCREEN_HEIGHT - 1);
-        let idx = xy_idx(x, y);
-        if idx != xy_idx(40, 25)
+        for x in min(x1, x2) ..= max(x1, x2)
         {
-            map[idx] = TileType::Wall;
+            let idx = self.xy_idx(x, y);
+            if idx > 0 && idx < self.width as usize * self.height as usize
+            {
+                self.tiles[idx as usize] = TileType::Floor;
+            }
         }
     }
 
-    return map;
+    fn apply_vertical_tunnel(&mut self, y1: i32, y2: i32, x: i32)
+    {
+        for y in min(y1, y2) ..= max(y1, y2)
+        {
+            let idx = self.xy_idx(x, y);
+            if idx > 0 && idx < self.width as usize * self.height as usize
+            {
+                self.tiles[idx as usize] = TileType::Floor;
+            }
+        }
+    }
+
+    pub fn apply_room_to_map(&mut self, room: &Rect) -> ()
+    {
+        for y in room.y1 + 1..=room.y2
+        {
+            for x in room.x1 + 1..=room.x2
+            {
+                let idx = self.xy_idx(x, y);
+                self.tiles[idx] = TileType::Floor;
+            }
+        }
+    }
+
+    pub fn new_map_rooms_and_corridors() -> Map
+    {
+        let mut map = Map
+        {
+            tiles: vec![TileType::Wall; 80*50],
+            rooms: Vec::new(),
+            width: 80,
+            height: 50,
+            revealed_tiles: vec![false; 80*50],
+            visible_tiles: vec![false; 80*50],
+        };
+
+        const MAX_ROOMS: i32 = 30;
+        const MIN_SIZE: i32 = 6;
+        const MAX_SIZE: i32 = 10;
+
+        let mut rng = RandomNumberGenerator::new();
+
+        for _ in 0..MAX_ROOMS {
+            let w = rng.range(MIN_SIZE, MAX_SIZE);
+            let h = rng.range(MIN_SIZE, MAX_SIZE);
+            let x = rng.roll_dice(1, 80 - w - 1) - 1;
+            let y = rng.roll_dice(1, 50 - h - 1) - 1;
+
+            let new_room = Rect::new(x, y, w, h);
+            let mut ok = true;
+
+            for other_room in map.rooms.iter() {
+                if new_room.is_intersecting(other_room) { ok = false }
+            }
+
+            if ok {
+                map.apply_room_to_map(&new_room);
+
+                if !map.rooms.is_empty() {
+                    let (new_x, new_y) = new_room.center();
+                    let (prev_x, prev_y) = map.rooms[map.rooms.len() - 1].center();
+
+                    if rng.range(0, 2) == 1 {
+                        map.apply_horizontal_tunnel(prev_x, new_x, prev_y);
+                        map.apply_vertical_tunnel(prev_y, new_y, new_x);
+                    } else {
+                        map.apply_vertical_tunnel(prev_y, new_y, prev_x);
+                        map.apply_horizontal_tunnel(prev_x, new_x, new_y);
+                    }
+                }
+
+                map.rooms.push(new_room);
+            }
+        }
+
+        return map;
+    }
 }
 
 
-pub fn draw_map(map: &[TileType], ctx: &mut Rltk) -> ()
+impl Algorithm2D for Map
 {
+    fn dimensions(&self) -> Point
+    {
+        return Point::new(self.width, self.height);
+    }
+}
+
+
+impl BaseMap for Map
+{
+    fn is_opaque(&self, idx: usize) -> bool
+    {
+        return self.tiles[idx as usize] == TileType::Wall;
+    }
+}
+
+
+pub fn draw_map(ecs: &World, ctx: &mut Rltk) -> ()
+{
+    let map = ecs.fetch::<Map>();
+
     let mut y = 0;
     let mut x = 0;
-    for tile in map.iter()
+
+    for (idx, tile) in map.tiles.iter().enumerate()
     {
-        match tile
-        {
-            TileType::Floor => {
-                ctx.set(
-                    x, y,
-                    RGB::from_f32(0.5, 0.5, 0.5),
-                    RGB::from_f32(0., 0., 0.),
-                    rltk::to_cp437('.')
-                );
+        if map.revealed_tiles[idx] {
+            let glyph;
+            let mut fg;
+
+            match tile {
+                TileType::Floor => {
+                    glyph = rltk::to_cp437('.');
+                    fg = RGB::from_f32(0.0, 0.5, 0.5);
+                }
+                TileType::Wall => {
+                    glyph = rltk::to_cp437('#');
+                    fg = RGB::from_f32(0.0, 1.0, 0.0);
+                }
             }
-            TileType::Wall => {
-                ctx.set(
-                    x, y,
-                    RGB::from_f32(0.0, 0.5, 0.0),
-                    RGB::from_f32(0., 0., 0.),
-                    rltk::to_cp437('#')
-                );
-            }
+
+            if !map.visible_tiles[idx] { fg = RGB::from_f32(fg.r/4., fg.g/4., fg.b/4.) }
+            ctx.set(x, y, fg, RGB::from_f32(0., 0., 0.), glyph);
         }
 
         x += 1;
-        if x > SCREEN_WIDTH - 1
-        {
+        if x > 79 {
             x = 0;
             y += 1;
         }
